@@ -10,7 +10,7 @@ const news = [
   {
     id: "earned-recognition-pack",
     date: "2025-10-10",
-    title: "CTRL launches Earned Recognition prep pack",
+    title: "CTRL launches Earned Recognition prep pack!",
     blurb: "A practical set of templates and checks aligned to DVSA ER KPIs.",
     content: "<p>We’ve released a practical pack…</p>"
   },
