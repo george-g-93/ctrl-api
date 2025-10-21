@@ -109,6 +109,18 @@ app.get("/news/:id", (req, res) => {
   res.json(item);
 });
 
+app.use((req, _res, next) => {
+  if (req.path.startsWith('/admin')) {
+    console.log('[ADMIN]', req.method, req.path, {
+      hasSession: !!req.session,
+      csrfCookie: req.session?.csrf,
+      csrfHeader: req.get('X-CSRF-Token'),
+      contentType: req.get('Content-Type'),
+    });
+  }
+  next();
+});
+
 // issue a CSRF token for admin pages
 app.get("/admin/csrf", (req, res) => {
   if (!req.session.csrf) req.session.csrf = Math.random().toString(36).slice(2);
