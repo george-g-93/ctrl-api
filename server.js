@@ -1,5 +1,9 @@
 import express from "express";
 import cors from "cors";
+import mongoose from "mongoose";
+import rateLimit from "express-rate-limit";
+import { z } from "zod";
+import ContactMessage from "./models/ContactMessage.js"; // <-- ensure this file exists
 
 const app = express();
 // CORS – allow your web origin
