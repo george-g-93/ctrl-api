@@ -52,30 +52,34 @@ const ContactSchema = z.object({
   website: z.string().optional().default(""), // honeypot
 });
 
-// --- CONTACT ROUTE ---
-app.post("/contact", contactLimiter, async (req, res) => {
-  try {
-    // simple bot trap: reject if honeypot field filled
-    if (typeof req.body.website === "string" && req.body.website.trim() !== "") {
-      return res.status(204).end(); // quietly ignore spam
-    }
+// // --- CONTACT ROUTE ---
+// app.post("/contact", contactLimiter, async (req, res) => {
+//   try {
+//     // simple bot trap: reject if honeypot field filled
+//     if (typeof req.body.website === "string" && req.body.website.trim() !== "") {
+//       return res.status(204).end(); // quietly ignore spam
+//     }
 
-    const data = ContactSchema.parse(req.body);
+//     const data = ContactSchema.parse(req.body);
 
-    const doc = await ContactMessage.create({
-      ...data,
-      ip: req.headers["x-forwarded-for"]?.toString().split(",")[0] ?? req.ip,
-      ua: req.headers["user-agent"] ?? "",
-    });
+//     const doc = await ContactMessage.create({
+//       ...data,
+//       ip: req.headers["x-forwarded-for"]?.toString().split(",")[0] ?? req.ip,
+//       ua: req.headers["user-agent"] ?? "",
+//     });
 
-    return res.status(201).json({ ok: true, id: doc._id });
-  } catch (err) {
-    if (err?.issues) {
-      return res.status(400).json({ ok: false, error: "Validation failed", details: err.issues });
-    }
-    console.error(err);
-    return res.status(500).json({ ok: false, error: "Server error" });
-  }
+//     return res.status(201).json({ ok: true, id: doc._id });
+//   } catch (err) {
+//     if (err?.issues) {
+//       return res.status(400).json({ ok: false, error: "Validation failed", details: err.issues });
+//     }
+//     console.error(err);
+//     return res.status(500).json({ ok: false, error: "Server error" });
+//   }
+// });
+
+app.post("/contact", (req, res) => {
+  res.status(201).json({ ok: true, echo: req.body ?? null });
 });
 
 app.get("/news", (_req, res) => {
