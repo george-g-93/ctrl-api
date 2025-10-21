@@ -8,6 +8,8 @@ import bcrypt from "bcryptjs";
 import session from "cookie-session"; // package name: cookie-session
 
 const app = express();
+
+app.set("trust proxy", 1); // behind Nginx
 // CORS – allow your web origin
 app.use(cors({
   origin: ["https://ctrlcompliance.co.uk", "https://www.ctrlcompliance.co.uk"],
@@ -17,7 +19,7 @@ app.use(cors({
 }));
 app.use(express.json());
 
-app.set("trust proxy", 1); // behind Nginx
+
 app.use(session({
   name: "sid",
   secret: process.env.SESSION_SECRET || "dev-secret",
@@ -71,36 +73,6 @@ const ContactSchema = z.object({
   read: { type: Boolean, default: false },
   deletedAt: { type: Date, default: null },
 });
-
-// // --- CONTACT ROUTE ---
-// app.post("/contact", contactLimiter, async (req, res) => {
-//   try {
-//     // simple bot trap: reject if honeypot field filled
-//     if (typeof req.body.website === "string" && req.body.website.trim() !== "") {
-//       return res.status(204).end(); // quietly ignore spam
-//     }
-
-//     const data = ContactSchema.parse(req.body);
-
-//     const doc = await ContactMessage.create({
-//       ...data,
-//       ip: req.headers["x-forwarded-for"]?.toString().split(",")[0] ?? req.ip,
-//       ua: req.headers["user-agent"] ?? "",
-//     });
-
-//     return res.status(201).json({ ok: true, id: doc._id });
-//   } catch (err) {
-//     if (err?.issues) {
-//       return res.status(400).json({ ok: false, error: "Validation failed", details: err.issues });
-//     }
-//     console.error(err);
-//     return res.status(500).json({ ok: false, error: "Server error" });
-//   }
-// });
-
-// app.post("/contact", (req, res) => {
-//   res.status(201).json({ ok: true, echo: req.body ?? null });
-// });
 
 app.post("/contact", contactLimiter, async (req, res) => {
   try {
