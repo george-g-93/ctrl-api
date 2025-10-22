@@ -18,6 +18,13 @@ app.use(cors({
   credentials: true,
 }));
 app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
+app.use((req, _res, next) => {
+  if (req.is('text/plain') && typeof req.body === 'string') {
+    try { req.body = JSON.parse(req.body); } catch { /* leave as string */ }
+  }
+  next();
+});
 
 
 app.use(session({
