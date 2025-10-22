@@ -1,19 +1,18 @@
-// /opt/ctrl-api/models/ContactMessage.js
 import mongoose from "mongoose";
 
-const ContactMessageSchema = new mongoose.Schema(
-  {
-    name: { type: String, required: true, trim: true },
-    company: { type: String, trim: true },
-    email: { type: String, required: true, trim: true, lowercase: true },
-    fleetSize: { type: String, trim: true },
-    message: { type: String, required: true, trim: true },
-    // spam honeypot (should stay empty):
-    website: { type: String, default: "" },
-    ip: String,
-    ua: String,
-  },
-  { timestamps: true }
-);
+const ContactMessageSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  company: { type: String, default: "" },
+  email: { type: String, required: true },
+  fleetSize: { type: String, default: "" },
+  message: { type: String, required: true },
+  website: { type: String, default: "" }, // honeypot
+  ip: { type: String, default: "" },
+  ua: { type: String, default: "" },
+
+  // 🔑 These two must be present so PATCH can set them
+  read: { type: Boolean, default: false },
+  deletedAt: { type: Date, default: null },
+}, { timestamps: true });
 
 export default mongoose.model("ContactMessage", ContactMessageSchema);
