@@ -57,6 +57,21 @@ const news = [
   }
 ];
 
+
+function isMfaEnrolled(req) {
+  return !!req.session?.mfaEnrolled;         // true once user completes verify
+}
+function isMfaVerified(req) {
+  return !!req.session?.mfaVerified;         // true for this session after verifying a code
+}
+function getPersistedMfaSecret(req) {
+  return req.session?.mfaSecret || "";       // store secret in session for the single admin
+}
+function setPersistedMfaSecret(req, secret) {
+  req.session.mfaSecret = secret;
+  req.session.mfaEnrolled = true;
+}
+
 // --- Connect to Mongo ---
 const mongoUri = process.env.MONGODB_URI; // set in systemd env or .env
 mongoose.set("strictQuery", true);
@@ -158,46 +173,67 @@ const requireMfa = (req, res, next) => {
 
 app.post("/admin/login", requireCsrf, async (req, res) => {
   const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ ok:false, error:"Missing credentials" });
+  if (!email || !password) return res.status(400).json({ ok: false, error: "Missing credentials" });
 
   const ok = email === process.env.ADMIN_EMAIL &&
-             await bcrypt.compare(password, process.env.ADMIN_PASSWORD_HASH || "");
-  if (!ok) return res.status(401).json({ ok:false, error:"Invalid credentials" });
+    await bcrypt.compare(password, process.env.ADMIN_PASSWORD_HASH || "");
+  if (!ok) return res.status(401).json({ ok: false, error: "Invalid credentials" });
 
+  // baseline session
   req.session.admin = true;
   req.session.email = email;
-  req.session.mfa = false; // must prove 2nd factor next
 
-  const hasSecret = !!process.env.ADMIN_TOTP_SECRET;
-  return res.json({ ok:true, mfaRequired: true, enrolled: hasSecret });
+  // after login, enforce MFA if enrolled OR allow enrolment if not yet enrolled
+  const enrolled = isMfaEnrolled(req);
+
+  // IMPORTANT: you haven’t verified MFA for this *session* yet
+  req.session.mfaVerified = false;
+
+  return res.json({ ok: true, mfaRequired: true, enrolled });
 });
 
 app.post("/admin/logout", requireAdmin, requireCsrf, (req, res) => {
   req.session = null;
-  res.json({ ok:true });
+  res.json({ ok: true });
 });
 
-app.get("/admin/messages", requireAdmin, async (req, res) => {
-  const { page = "1", limit = "20", read, q, includeDeleted = "false" } = req.query;
-  const skip = (Math.max(parseInt(page), 1) - 1) * Math.max(parseInt(limit), 1);
-  const where = {};
-  if (read === "true") where.read = true;
-  if (read === "false") where.read = false;
-  if (includeDeleted !== "true") where.deletedAt = null;
-  if (q) {
-    where.$or = [
-      { name: { $regex: q, $options: "i" } },
-      { email: { $regex: q, $options: "i" } },
-      { company: { $regex: q, $options: "i" } },
-      { message: { $regex: q, $options: "i" } },
-    ];
+const requireAdminAndMfa = (req, res, next) => {
+  if (req.path.startsWith("/admin/2fa/")) return next(); // allow MFA flow
+  if (!req.session?.admin) return res.status(401).json({ ok: false, error: "Unauthorized" });
+  if (!isMfaEnrolled(req)) {
+    return res.status(401).json({ ok: false, error: "MFA required (not enrolled)" });
   }
-  const [items, total] = await Promise.all([
-    ContactMessage.find(where).sort({ createdAt: -1 }).skip(skip).limit(Math.max(parseInt(limit), 1)),
-    ContactMessage.countDocuments(where),
-  ]);
-  res.json({ ok: true, items, total });
-});
+  if (!isMfaVerified(req)) {
+    return res.status(401).json({ ok: false, error: "MFA required" });
+  }
+  next();
+};
+
+// protect your admin data routes with this middleware
+app.use("/admin/messages", requireAdminAndMfa);
+
+
+// app.get("/admin/messages", requireAdmin, async (req, res) => {
+//   const { page = "1", limit = "20", read, q, includeDeleted = "false" } = req.query;
+//   const skip = (Math.max(parseInt(page), 1) - 1) * Math.max(parseInt(limit), 1);
+//   const where = {};
+//   if (read === "true") where.read = true;
+//   if (read === "false") where.read = false;
+//   if (includeDeleted !== "true") where.deletedAt = null;
+//   if (q) {
+//     where.$or = [
+//       { name: { $regex: q, $options: "i" } },
+//       { email: { $regex: q, $options: "i" } },
+//       { company: { $regex: q, $options: "i" } },
+//       { message: { $regex: q, $options: "i" } },
+//     ];
+//   }
+//   const [items, total] = await Promise.all([
+//     ContactMessage.find(where).sort({ createdAt: -1 }).skip(skip).limit(Math.max(parseInt(limit), 1)),
+//     ContactMessage.countDocuments(where),
+//   ]);
+//   res.json({ ok: true, items, total });
+// });
 
 app.patch("/admin/messages/:id", requireAdmin, requireMfa, requireCsrf, async (req, res) => {
   const { id } = req.params;
@@ -225,43 +261,64 @@ app.post("/admin/messages/:id/restore", requireAdmin, requireCsrf, async (req, r
   res.json({ ok: true, item: doc });
 });
 
-app.post("/admin/2fa/setup", requireAdmin, requireCsrf, async (req, res) => {
-  if (process.env.ADMIN_TOTP_SECRET) {
-    return res.status(400).json({ ok:false, error:"Already enrolled" });
-  }
+app.post("/admin/2fa/setup", requireCsrf, (req, res) => {
+  if (!req.session?.admin) return res.status(401).json({ ok: false, error: "Unauthorized" });
+
+  // If already enrolled, you can rotate by generating a new pending secret
   const secret = speakeasy.generateSecret({
-    name: "CTRL Admin (api.ctrlcompliance.co.uk)",
-    length: 20, // base32 will be ~32 chars
+    name: `CTRL Admin (api.ctrlcompliance.co.uk)`,
+    length: 20,
   });
 
-  // persist secret (env for now). In production, store in DB or a secrets manager.
-  console.warn("SAVE THIS TOTP SECRET (base32) IN ADMIN_TOTP_SECRET:", secret.base32);
+  req.session.mfaPendingSecret = secret.base32; // <— KEY NAME USED BY VERIFY
 
-  const otpauth = secret.otpauth_url;
-  const qrDataUrl = await QRCode.toDataURL(otpauth);
-
-  return res.json({ ok:true, secret: secret.base32, otpauth, qr: qrDataUrl });
+  QRCode.toDataURL(secret.otpauth_url, (err, dataUrl) => {
+    if (err) return res.status(500).json({ ok: false, error: "QR error" });
+    res.json({
+      ok: true,
+      secret: secret.base32,
+      otpauth: secret.otpauth_url,
+      qr: dataUrl,
+    });
+  });
 });
 
-app.post("/admin/2fa/verify", requireAdmin, requireCsrf, (req, res) => {
-  const { token } = req.body || {};
-  if (!token) return res.status(400).json({ ok:false, error:"Missing token" });
-  const secret = process.env.ADMIN_TOTP_SECRET;
-  if (!secret) return res.status(400).json({ ok:false, error:"Not enrolled" });
 
-  const verified = speakeasy.totp.verify({
+app.post("/admin/2fa/verify", requireCsrf, (req, res) => {
+  if (!req.session?.admin) return res.status(401).json({ ok: false, error: "Unauthorized" });
+
+  const { token } = req.body || {};
+  if (!token) return res.status(400).json({ ok: false, error: "Missing token" });
+
+  // Prefer pending secret (enrol flow); otherwise use saved secret (normal login)
+  const pending = req.session.mfaPendingSecret;
+  const saved = getPersistedMfaSecret(req);
+  const secret = pending || saved;
+
+  if (!secret) {
+    return res.status(400).json({ ok: false, error: "Not enrolled" });
+  }
+
+  const valid = speakeasy.totp.verify({
     secret,
     encoding: "base32",
     token,
-    window: 1, // allow small clock drift (+/- 30s)
-    step: 30,
-    digits: 6,
+    window: 1, // tolerate ±30s drift
   });
 
-  if (!verified) return res.status(401).json({ ok:false, error:"Invalid token" });
-  req.session.mfa = true;
-  return res.json({ ok:true });
+  if (!valid) return res.status(401).json({ ok: false, error: "Invalid code" });
+
+  // first-time enrol: persist secret and clear pending
+  if (pending && !saved) {
+    setPersistedMfaSecret(req, pending);
+    delete req.session.mfaPendingSecret;
+  }
+
+  // mark this session as MFA-verified
+  req.session.mfaVerified = true;
+  return res.json({ ok: true });
 });
+
 
 
 const port = process.env.PORT || 3000;
