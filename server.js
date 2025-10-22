@@ -8,6 +8,7 @@ import bcrypt from "bcryptjs";
 import session from "cookie-session"; // package name: cookie-session
 import speakeasy from "speakeasy";
 import QRCode from "qrcode";
+import AdminUser from "./models/AdminUser.js";
 
 
 const app = express();
@@ -58,18 +59,23 @@ const news = [
 ];
 
 
-function isMfaEnrolled(req) {
-  return !!req.session?.mfaEnrolled;         // true once user completes verify
+async function isMfaEnrolled(email) {
+  const u = await AdminUser.findOne({ email }).lean();
+  return !!u?.mfaSecret;
 }
 function isMfaVerified(req) {
-  return !!req.session?.mfaVerified;         // true for this session after verifying a code
+  return !!req.session?.mfaVerified; // session flag still per-login
 }
-function getPersistedMfaSecret(req) {
-  return req.session?.mfaSecret || "";       // store secret in session for the single admin
+async function getPersistedMfaSecret(email) {
+  const u = await AdminUser.findOne({ email }).lean();
+  return u?.mfaSecret || "";
 }
-function setPersistedMfaSecret(req, secret) {
-  req.session.mfaSecret = secret;
-  req.session.mfaEnrolled = true;
+async function setPersistedMfaSecret(email, secret) {
+  await AdminUser.findOneAndUpdate(
+    { email },
+    { $set: { mfaSecret: secret } },
+    { upsert: true }
+  );
 }
 
 // --- Connect to Mongo ---
@@ -180,12 +186,20 @@ app.post("/admin/login", requireCsrf, async (req, res) => {
     await bcrypt.compare(password, process.env.ADMIN_PASSWORD_HASH || "");
   if (!ok) return res.status(401).json({ ok: false, error: "Invalid credentials" });
 
+  // ensure a record exists for this admin email
+  const user = await AdminUser.findOneAndUpdate(
+    { email },
+    { $setOnInsert: { email } },
+    { new: true, upsert: true }
+  );
+
   // baseline session
   req.session.admin = true;
   req.session.email = email;
 
+
   // after login, enforce MFA if enrolled OR allow enrolment if not yet enrolled
-  const enrolled = isMfaEnrolled(req);
+  const enrolled = !!user.mfaSecret;
 
   // IMPORTANT: you haven’t verified MFA for this *session* yet
   req.session.mfaVerified = false;
@@ -198,17 +212,16 @@ app.post("/admin/logout", requireAdmin, requireCsrf, (req, res) => {
   res.json({ ok: true });
 });
 
-const requireAdminAndMfa = (req, res, next) => {
-  if (req.path.startsWith("/admin/2fa/")) return next(); // allow MFA flow
+const requireAdminAndMfa = async (req, res, next) => {
+  if (req.path.startsWith("/admin/2fa/")) return next();
   if (!req.session?.admin) return res.status(401).json({ ok: false, error: "Unauthorized" });
-  if (!isMfaEnrolled(req)) {
+  if (!(await isMfaEnrolled(req.session.email))) {
     return res.status(401).json({ ok: false, error: "MFA required (not enrolled)" });
   }
-  if (!isMfaVerified(req)) {
-    return res.status(401).json({ ok: false, error: "MFA required" });
-  }
+  if (!isMfaVerified(req)) return res.status(401).json({ ok: false, error: "MFA required" });
   next();
 };
+
 
 // protect your admin data routes with this middleware
 app.use("/admin/messages", requireAdminAndMfa);
@@ -285,7 +298,7 @@ app.post("/admin/2fa/setup", requireCsrf, (req, res) => {
 });
 
 
-app.post("/admin/2fa/verify", requireCsrf, (req, res) => {
+app.post("/admin/2fa/verify", requireCsrf, async (req, res) => {
   if (!req.session?.admin) return res.status(401).json({ ok: false, error: "Unauthorized" });
 
   const { token } = req.body || {};
@@ -293,7 +306,7 @@ app.post("/admin/2fa/verify", requireCsrf, (req, res) => {
 
   // Prefer pending secret (enrol flow); otherwise use saved secret (normal login)
   const pending = req.session.mfaPendingSecret;
-  const saved = getPersistedMfaSecret(req);
+  const saved = await getPersistedMfaSecret(req.session.email);
   const secret = pending || saved;
 
   if (!secret) {
@@ -311,7 +324,7 @@ app.post("/admin/2fa/verify", requireCsrf, (req, res) => {
 
   // first-time enrol: persist secret and clear pending
   if (pending && !saved) {
-    setPersistedMfaSecret(req, pending);
+    await setPersistedMfaSecret(req.session.email, pending);
     delete req.session.mfaPendingSecret;
   }
 
