@@ -6,6 +6,9 @@ import { z } from "zod";
 import ContactMessage from "./models/ContactMessage.js"; // <-- ensure this file exists
 import bcrypt from "bcryptjs";
 import session from "cookie-session"; // package name: cookie-session
+import speakeasy from "speakeasy";
+import QRCode from "qrcode";
+
 
 const app = express();
 
@@ -146,23 +149,32 @@ const requireAdmin = (req, res, next) => {
   return res.status(401).json({ ok: false, error: "Unauthorized" });
 };
 
+const requireMfa = (req, res, next) => {
+  if (req.session?.mfa === true) return next();
+  return res.status(401).json({ ok: false, error: "MFA required" });
+};
+
+
 
 app.post("/admin/login", requireCsrf, async (req, res) => {
   const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ ok: false, error: "Missing credentials" });
+  if (!email || !password) return res.status(400).json({ ok:false, error:"Missing credentials" });
 
   const ok = email === process.env.ADMIN_EMAIL &&
-    await bcrypt.compare(password, process.env.ADMIN_PASSWORD_HASH || "");
-  if (!ok) return res.status(401).json({ ok: false, error: "Invalid credentials" });
+             await bcrypt.compare(password, process.env.ADMIN_PASSWORD_HASH || "");
+  if (!ok) return res.status(401).json({ ok:false, error:"Invalid credentials" });
 
   req.session.admin = true;
   req.session.email = email;
-  return res.json({ ok: true });
+  req.session.mfa = false; // must prove 2nd factor next
+
+  const hasSecret = !!process.env.ADMIN_TOTP_SECRET;
+  return res.json({ ok:true, mfaRequired: true, enrolled: hasSecret });
 });
 
 app.post("/admin/logout", requireAdmin, requireCsrf, (req, res) => {
   req.session = null;
-  res.json({ ok: true });
+  res.json({ ok:true });
 });
 
 app.get("/admin/messages", requireAdmin, async (req, res) => {
@@ -187,7 +199,7 @@ app.get("/admin/messages", requireAdmin, async (req, res) => {
   res.json({ ok: true, items, total });
 });
 
-app.patch("/admin/messages/:id", requireAdmin, requireCsrf, async (req, res) => {
+app.patch("/admin/messages/:id", requireAdmin, requireMfa, requireCsrf, async (req, res) => {
   const { id } = req.params;
   const { read } = req.body || {};
   if (!mongoose.isValidObjectId(id)) return res.status(400).json({ ok: false, error: "Bad id" });
@@ -212,6 +224,45 @@ app.post("/admin/messages/:id/restore", requireAdmin, requireCsrf, async (req, r
   if (!doc) return res.status(404).json({ ok: false, error: "Not found" });
   res.json({ ok: true, item: doc });
 });
+
+app.post("/admin/2fa/setup", requireAdmin, requireCsrf, async (req, res) => {
+  if (process.env.ADMIN_TOTP_SECRET) {
+    return res.status(400).json({ ok:false, error:"Already enrolled" });
+  }
+  const secret = speakeasy.generateSecret({
+    name: "CTRL Admin (api.ctrlcompliance.co.uk)",
+    length: 20, // base32 will be ~32 chars
+  });
+
+  // persist secret (env for now). In production, store in DB or a secrets manager.
+  console.warn("SAVE THIS TOTP SECRET (base32) IN ADMIN_TOTP_SECRET:", secret.base32);
+
+  const otpauth = secret.otpauth_url;
+  const qrDataUrl = await QRCode.toDataURL(otpauth);
+
+  return res.json({ ok:true, secret: secret.base32, otpauth, qr: qrDataUrl });
+});
+
+app.post("/admin/2fa/verify", requireAdmin, requireCsrf, (req, res) => {
+  const { token } = req.body || {};
+  if (!token) return res.status(400).json({ ok:false, error:"Missing token" });
+  const secret = process.env.ADMIN_TOTP_SECRET;
+  if (!secret) return res.status(400).json({ ok:false, error:"Not enrolled" });
+
+  const verified = speakeasy.totp.verify({
+    secret,
+    encoding: "base32",
+    token,
+    window: 1, // allow small clock drift (+/- 30s)
+    step: 30,
+    digits: 6,
+  });
+
+  if (!verified) return res.status(401).json({ ok:false, error:"Invalid token" });
+  req.session.mfa = true;
+  return res.json({ ok:true });
+});
+
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`CTRL API listening on ${port}`));
