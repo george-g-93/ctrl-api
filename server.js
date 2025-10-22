@@ -70,9 +70,12 @@ const ContactSchema = z.object({
   fleetSize: z.string().optional().default(""),
   message: z.string().min(5),
   website: z.string().optional().default(""), // honeypot
-  read: { type: Boolean, default: false },
-  deletedAt: { type: Date, default: null },
 });
+
+const MessageUpdateSchema = z.object({
+  read: z.boolean(),
+});
+
 
 app.post("/contact", contactLimiter, async (req, res) => {
   try {
