@@ -103,6 +103,20 @@ const ContactSchema = z.object({
   website: z.string().optional().default(""), // honeypot
 });
 
+// --- Validation schema ---
+const NewUserSchema = z.object({
+  email: z.string().email(),
+  name: z.string().min(2).optional().default(""),
+  password: z.string().min(8, "Minimum 8 characters"),
+});
+
+const UpdateUserSchema = z.object({
+  name: z.string().min(2).optional(),
+  disabled: z.boolean().optional(),
+  password: z.string().min(8).optional(),
+});
+
+
 const MessageUpdateSchema = z.object({
   read: z.boolean(),
 });
@@ -178,34 +192,62 @@ const requireMfa = (req, res, next) => {
 
 
 
+// app.post("/admin/login", requireCsrf, async (req, res) => {
+//   const { email, password } = req.body || {};
+//   if (!email || !password) return res.status(400).json({ ok: false, error: "Missing credentials" });
+
+//   const ok = email === process.env.ADMIN_EMAIL &&
+//     await bcrypt.compare(password, process.env.ADMIN_PASSWORD_HASH || "");
+//   if (!ok) return res.status(401).json({ ok: false, error: "Invalid credentials" });
+
+//   // ensure a record exists for this admin email
+//   const user = await AdminUser.findOneAndUpdate(
+//     { email },
+//     { $setOnInsert: { email } },
+//     { new: true, upsert: true }
+//   );
+
+//   // baseline session
+//   req.session.admin = true;
+//   req.session.email = email;
+
+
+//   // after login, enforce MFA if enrolled OR allow enrolment if not yet enrolled
+//   const enrolled = !!user.mfaSecret;
+
+//   // IMPORTANT: you haven’t verified MFA for this *session* yet
+//   req.session.mfaVerified = false;
+
+//   return res.json({ ok: true, mfaRequired: true, enrolled });
+// });
+
 app.post("/admin/login", requireCsrf, async (req, res) => {
   const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ ok: false, error: "Missing credentials" });
+  if (!email || !password) {
+    return res.status(400).json({ ok: false, error: "Missing credentials" });
+  }
 
-  const ok = email === process.env.ADMIN_EMAIL &&
-    await bcrypt.compare(password, process.env.ADMIN_PASSWORD_HASH || "");
-  if (!ok) return res.status(401).json({ ok: false, error: "Invalid credentials" });
+  const user = await AdminUser.findOne({ email });
+  if (!user) {
+    return res.status(401).json({ ok: false, error: "Invalid credentials" });
+  }
 
-  // ensure a record exists for this admin email
-  const user = await AdminUser.findOneAndUpdate(
-    { email },
-    { $setOnInsert: { email } },
-    { new: true, upsert: true }
-  );
+  const ok = await bcrypt.compare(password, user.passwordHash);
+  if (!ok) {
+    return res.status(401).json({ ok: false, error: "Invalid credentials" });
+  }
 
   // baseline session
   req.session.admin = true;
   req.session.email = email;
-
-
-  // after login, enforce MFA if enrolled OR allow enrolment if not yet enrolled
-  const enrolled = !!user.mfaSecret;
-
-  // IMPORTANT: you haven’t verified MFA for this *session* yet
   req.session.mfaVerified = false;
+  user.lastLoginAt = new Date();
+  await user.save();
 
+  const enrolled = !!user.mfaSecret;
   return res.json({ ok: true, mfaRequired: true, enrolled });
 });
+
 
 app.post("/admin/logout", requireAdmin, requireCsrf, (req, res) => {
   req.session = null;
@@ -225,6 +267,7 @@ const requireAdminAndMfa = async (req, res, next) => {
 
 // protect your admin data routes with this middleware
 app.use("/admin/messages", requireAdminAndMfa);
+app.use("/admin/users", requireAdminAndMfa);
 
 
 app.get("/admin/messages", requireAdmin, async (req, res) => {
@@ -265,6 +308,58 @@ app.delete("/admin/messages/:id", requireCsrf, async (req, res) => {
   if (!doc) return res.status(404).json({ ok: false, error: "Not found" });
   res.json({ ok: true, item: doc });
 });
+
+// ---------- Admin Users ----------
+import mongoosePkg from "mongoose"; // if not already available as mongoose.*
+const { isValidObjectId } = mongoosePkg || mongoose;
+
+app.get("/admin/users", async (req, res) => {
+  const users = await AdminUser.find({}, { // projection: only safe fields
+    email: 1, name: 1, disabled: 1, lastLoginAt: 1, createdAt: 1,
+  }).sort({ createdAt: -1 }).lean();
+  res.json({ ok: true, items: users });
+});
+
+app.post("/admin/users", requireCsrf, async (req, res) => {
+  const { email, name, password } = NewUserSchema.parse(req.body);
+  const exists = await AdminUser.findOne({ email });
+  if (exists) return res.status(409).json({ ok: false, error: "Email already exists" });
+  const passwordHash = await bcrypt.hash(password, 12);
+  const doc = await AdminUser.create({ email, name, passwordHash, disabled: false });
+  res.status(201).json({ ok: true, id: doc._id });
+});
+
+app.patch("/admin/users/:id", requireCsrf, async (req, res) => {
+  const { id } = req.params;
+  if (!isValidObjectId(id)) return res.status(400).json({ ok: false, error: "Bad id" });
+
+  const data = UpdateUserSchema.parse(req.body);
+  const update = { ...("name" in data ? { name: data.name } : {}), ...("disabled" in data ? { disabled: data.disabled } : {}) };
+  if (data.password) update.passwordHash = await bcrypt.hash(data.password, 12);
+
+  const user = await AdminUser.findByIdAndUpdate(id, { $set: update }, { new: true });
+  if (!user) return res.status(404).json({ ok: false, error: "Not found" });
+  res.json({ ok: true, item: { _id: user._id, email: user.email, name: user.name, disabled: user.disabled } });
+});
+
+app.delete("/admin/users/:id", requireCsrf, async (req, res) => {
+  const { id } = req.params;
+  if (!isValidObjectId(id)) return res.status(400).json({ ok: false, error: "Bad id" });
+  // Hard delete; switch to soft if you prefer
+  const r = await AdminUser.deleteOne({ _id: id });
+  if (!r.deletedCount) return res.status(404).json({ ok: false, error: "Not found" });
+  res.json({ ok: true });
+});
+
+// Reset a user's MFA (forces re-enrol on next login)
+app.post("/admin/users/:id/reset-mfa", requireCsrf, async (req, res) => {
+  const { id } = req.params;
+  if (!isValidObjectId(id)) return res.status(400).json({ ok: false, error: "Bad id" });
+  const user = await AdminUser.findByIdAndUpdate(id, { $unset: { mfaSecret: 1 } }, { new: true });
+  if (!user) return res.status(404).json({ ok: false, error: "Not found" });
+  res.json({ ok: true });
+});
+
 
 // Optional: restore
 app.post("/admin/messages/:id/restore", requireCsrf, async (req, res) => {
