@@ -165,9 +165,10 @@ const requireAdmin = (req, res, next) => {
 };
 
 const requireMfa = (req, res, next) => {
-  if (req.session?.mfa === true) return next();
+  if (req.session?.mfaVerified === true) return next();
   return res.status(401).json({ ok: false, error: "MFA required" });
 };
+
 
 
 
@@ -213,29 +214,29 @@ const requireAdminAndMfa = (req, res, next) => {
 app.use("/admin/messages", requireAdminAndMfa);
 
 
-// app.get("/admin/messages", requireAdmin, async (req, res) => {
-//   const { page = "1", limit = "20", read, q, includeDeleted = "false" } = req.query;
-//   const skip = (Math.max(parseInt(page), 1) - 1) * Math.max(parseInt(limit), 1);
-//   const where = {};
-//   if (read === "true") where.read = true;
-//   if (read === "false") where.read = false;
-//   if (includeDeleted !== "true") where.deletedAt = null;
-//   if (q) {
-//     where.$or = [
-//       { name: { $regex: q, $options: "i" } },
-//       { email: { $regex: q, $options: "i" } },
-//       { company: { $regex: q, $options: "i" } },
-//       { message: { $regex: q, $options: "i" } },
-//     ];
-//   }
-//   const [items, total] = await Promise.all([
-//     ContactMessage.find(where).sort({ createdAt: -1 }).skip(skip).limit(Math.max(parseInt(limit), 1)),
-//     ContactMessage.countDocuments(where),
-//   ]);
-//   res.json({ ok: true, items, total });
-// });
+app.get("/admin/messages", requireAdmin, async (req, res) => {
+  const { page = "1", limit = "20", read, q, includeDeleted = "false" } = req.query;
+  const skip = (Math.max(parseInt(page), 1) - 1) * Math.max(parseInt(limit), 1);
+  const where = {};
+  if (read === "true") where.read = true;
+  if (read === "false") where.read = false;
+  if (includeDeleted !== "true") where.deletedAt = null;
+  if (q) {
+    where.$or = [
+      { name: { $regex: q, $options: "i" } },
+      { email: { $regex: q, $options: "i" } },
+      { company: { $regex: q, $options: "i" } },
+      { message: { $regex: q, $options: "i" } },
+    ];
+  }
+  const [items, total] = await Promise.all([
+    ContactMessage.find(where).sort({ createdAt: -1 }).skip(skip).limit(Math.max(parseInt(limit), 1)),
+    ContactMessage.countDocuments(where),
+  ]);
+  res.json({ ok: true, items, total });
+});
 
-app.patch("/admin/messages/:id", requireAdmin, requireMfa, requireCsrf, async (req, res) => {
+app.patch("/admin/messages/:id", requireCsrf, async (req, res) => {
   const { id } = req.params;
   const { read } = req.body || {};
   if (!mongoose.isValidObjectId(id)) return res.status(400).json({ ok: false, error: "Bad id" });
@@ -244,7 +245,7 @@ app.patch("/admin/messages/:id", requireAdmin, requireMfa, requireCsrf, async (r
   res.json({ ok: true, item: doc });
 });
 
-app.delete("/admin/messages/:id", requireAdmin, requireCsrf, async (req, res) => {
+app.delete("/admin/messages/:id", requireCsrf, async (req, res) => {
   const { id } = req.params;
   if (!mongoose.isValidObjectId(id)) return res.status(400).json({ ok: false, error: "Bad id" });
   const doc = await ContactMessage.findByIdAndUpdate(id, { $set: { deletedAt: new Date() } }, { new: true });
@@ -253,7 +254,7 @@ app.delete("/admin/messages/:id", requireAdmin, requireCsrf, async (req, res) =>
 });
 
 // Optional: restore
-app.post("/admin/messages/:id/restore", requireAdmin, requireCsrf, async (req, res) => {
+app.post("/admin/messages/:id/restore", requireCsrf, async (req, res) => {
   const { id } = req.params;
   if (!mongoose.isValidObjectId(id)) return res.status(400).json({ ok: false, error: "Bad id" });
   const doc = await ContactMessage.findByIdAndUpdate(id, { $set: { deletedAt: null } }, { new: true });
