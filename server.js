@@ -10,6 +10,7 @@ import speakeasy from "speakeasy";
 import QRCode from "qrcode";
 import AdminUser from "./models/AdminUser.js";
 import News from "./models/News.js";
+import slugify from "slugify";
 
 
 
@@ -57,21 +58,21 @@ app.use(session({
 }));
 
 // in-memory demo data; swap to DynamoDB later
-const news = [
-  {
-    id: "earned-recognition-pack",
-    date: "2025-10-10",
-    title: "CTRL launches Earned Recognition prep pack!",
-    blurb: "A practical set of templates and checks aligned to DVSA ER KPIs.",
-    content: "<p>We’ve released a practical pack…</p>"
-  },
-  {
-    id: "drivers-hours-pitfalls",
-    date: "2025-09-22",
-    title: "Webinar recap: Drivers’ hours pitfalls",
-    blurb: "Top 7 infringement patterns we keep seeing—and how to stop them."
-  }
-];
+// const news = [
+//   {
+//     id: "earned-recognition-pack",
+//     date: "2025-10-10",
+//     title: "CTRL launches Earned Recognition prep pack!",
+//     blurb: "A practical set of templates and checks aligned to DVSA ER KPIs.",
+//     content: "<p>We’ve released a practical pack…</p>"
+//   },
+//   {
+//     id: "drivers-hours-pitfalls",
+//     date: "2025-09-22",
+//     title: "Webinar recap: Drivers’ hours pitfalls",
+//     blurb: "Top 7 infringement patterns we keep seeing—and how to stop them."
+//   }
+// ];
 
 
 async function isMfaEnrolled(email) {
@@ -121,15 +122,19 @@ const ContactSchema = z.object({
 
 
 const NewsCreateSchema = z.object({
-  title: z.string().min(3),
-  slug: z.string().min(3).regex(/^[a-z0-9-]+$/i, "Slug must be URL-friendly"),
-  date: z.string().or(z.date()), // accept ISO string; we’ll coerce
-  blurb: z.string().optional().default(""),
+  title: z.string().min(3).max(180),
+  blurb: z.string().max(300).optional().default(""),
   content: z.string().optional().default(""),
-  published: z.boolean().optional().default(true),
+  coverUrl: z.string().url().optional().or(z.literal("")).default(""),
+  tags: z.array(z.string().min(1).max(24)).optional().default([]),
+  slug: z.string().min(3).max(200).optional().default(""),
+  status: z.enum(["draft","published"]).optional().default("draft"),
+  publishedAt: z.string().datetime().optional().nullable(),
 });
 
 const NewsUpdateSchema = NewsCreateSchema.partial();
+
+
 
 
 // --- Validation schema ---
@@ -230,15 +235,212 @@ const requireMfa = (req, res, next) => {
 
 app.use("/admin/news", requireAdminAndMfa); // same as messages/users
 
-app.get("/news", (_req, res) => {
-  const sorted = [...news].sort((a, b) => new Date(b.date) - new Date(a.date));
-  res.json(sorted);
+
+// app.get("/news", (_req, res) => {
+//   const sorted = [...news].sort((a, b) => new Date(b.date) - new Date(a.date));
+//   res.json(sorted);
+// });
+// app.get("/news/:id", (req, res) => {
+//   const item = news.find(n => n.id === req.params.id);
+//   if (!item) return res.status(404).json({ error: "Not found" });
+//   res.json(item);
+// });
+
+
+// GET public list (published only)
+app.get("/news", async (req, res) => {
+  const { page = "1", limit = "20" } = req.query;
+  const p = Math.max(parseInt(page), 1);
+  const l = Math.max(parseInt(limit), 1);
+
+  const where = { status: "published", deletedAt: null };
+  const [items, total] = await Promise.all([
+    News.find(where).sort({ publishedAt: -1, createdAt: -1 }).skip((p - 1) * l).limit(l).lean(),
+    News.countDocuments(where),
+  ]);
+
+  // keep a simple shape for the site
+  const out = items.map(n => ({
+    _id: n._id,
+    title: n.title,
+    slug: n.slug,
+    blurb: n.blurb,
+    date: n.publishedAt || n.createdAt,
+  }));
+
+  res.json({ items: out, total });
 });
-app.get("/news/:id", (req, res) => {
-  const item = news.find(n => n.id === req.params.id);
+
+// GET public single by slug
+app.get("/news/:slug", async (req, res) => {
+  const item = await News.findOne({
+    slug: req.params.slug,
+    status: "published",
+    deletedAt: null,
+  }).lean();
   if (!item) return res.status(404).json({ error: "Not found" });
-  res.json(item);
+
+  res.json({
+    _id: item._id,
+    title: item.title,
+    slug: item.slug,
+    blurb: item.blurb,
+    content: item.content,
+    coverUrl: item.coverUrl,
+    date: item.publishedAt || item.createdAt,
+    tags: item.tags || [],
+  });
 });
+
+
+// helper: convert admin form payload to model fields
+const NewsUpsertSchema = z.object({
+  title: z.string().min(2),
+  slug: z.string().trim().min(2).optional(),
+  blurb: z.string().max(300).optional().default(""),
+  content: z.string().optional().default(""),
+  coverUrl: z.string().optional().default(""),
+  tags: z.array(z.string()).optional().default([]),
+  // admin UI sends: date (YYYY-MM-DD) + published boolean
+  date: z.string().optional(),            // e.g. "2025-10-23"
+  published: z.boolean().optional().default(true),
+});
+
+// All /admin/news routes require admin+MFA
+app.use("/admin/news", requireAdminAndMfa);
+
+// LIST (admin)
+app.get("/admin/news", async (req, res) => {
+  const { page = "1", limit = "20", q } = req.query;
+  const p = Math.max(parseInt(page), 1);
+  const l = Math.max(parseInt(limit), 1);
+
+  const where = { deletedAt: null };
+  if (q) {
+    where.$or = [
+      { title: { $regex: q, $options: "i" } },
+      { slug:  { $regex: q, $options: "i" } },
+      { blurb: { $regex: q, $options: "i" } },
+    ];
+  }
+
+  const [items, total] = await Promise.all([
+    News.find(where).sort({ createdAt: -1 }).skip((p - 1) * l).limit(l).lean(),
+    News.countDocuments(where),
+  ]);
+
+  // shape it for your Admin.jsx (expects `date` + `published`)
+  const out = items.map(n => ({
+    _id: n._id,
+    title: n.title,
+    slug: n.slug,
+    blurb: n.blurb,
+    content: n.content,
+    coverUrl: n.coverUrl,
+    tags: n.tags || [],
+    date: (n.publishedAt || n.createdAt),
+    published: n.status === "published",
+  }));
+
+  res.json({ items: out, total });
+});
+
+// CREATE
+app.post("/admin/news", requireCsrf, async (req, res) => {
+  try {
+    const body = NewsUpsertSchema.parse(req.body);
+    const slug = (body.slug && body.slug.trim()) ||
+                 (await import("slugify")).default(body.title, { lower: true, strict: true });
+
+    const publishedAt = body.published
+      ? (body.date ? new Date(body.date) : new Date())
+      : null;
+
+    const doc = await News.create({
+      title: body.title,
+      slug,
+      blurb: body.blurb,
+      content: body.content,
+      coverUrl: body.coverUrl,
+      tags: body.tags,
+      status: body.published ? "published" : "draft",
+      publishedAt,
+    });
+
+    res.status(201).json({ ok: true, item: doc });
+  } catch (e) {
+    // duplicate slug -> 409
+    if (e?.code === 11000 && e?.keyPattern?.slug) {
+      return res.status(409).json({ ok: false, error: "Slug already exists" });
+    }
+    if (e?.issues) return res.status(400).json({ ok: false, error: "Validation failed", details: e.issues });
+    console.error(e);
+    res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+// UPDATE
+app.patch("/admin/news/:id", requireCsrf, async (req, res) => {
+  const { id } = req.params;
+  if (!mongoose.isValidObjectId(id)) return res.status(400).json({ ok: false, error: "Bad id" });
+
+  try {
+    const body = NewsUpsertSchema.partial().parse(req.body);
+
+    const update = {};
+    if (body.title !== undefined) update.title = body.title;
+    if (body.slug !== undefined)  update.slug  = body.slug.trim();
+    if (body.blurb !== undefined) update.blurb = body.blurb;
+    if (body.content !== undefined) update.content = body.content;
+    if (body.coverUrl !== undefined) update.coverUrl = body.coverUrl;
+    if (body.tags !== undefined) update.tags = body.tags;
+
+    // handle published/status + date
+    if (body.published !== undefined) {
+      update.status = body.published ? "published" : "draft";
+      if (body.published) {
+        update.publishedAt = body.date ? new Date(body.date) : new Date();
+      } else {
+        update.publishedAt = null;
+      }
+    } else if (body.date !== undefined) {
+      update.publishedAt = body.date ? new Date(body.date) : null;
+    }
+
+    const doc = await News.findByIdAndUpdate(id, { $set: update }, { new: true, runValidators: true });
+    if (!doc) return res.status(404).json({ ok: false, error: "Not found" });
+
+    res.json({ ok: true, item: doc });
+  } catch (e) {
+    if (e?.code === 11000 && e?.keyPattern?.slug) {
+      return res.status(409).json({ ok: false, error: "Slug already exists" });
+    }
+    if (e?.issues) return res.status(400).json({ ok: false, error: "Validation failed", details: e.issues });
+    console.error(e);
+    res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+// DELETE (soft delete)
+app.delete("/admin/news/:id", requireCsrf, async (req, res) => {
+  const { id } = req.params;
+  if (!mongoose.isValidObjectId(id)) return res.status(400).json({ ok: false, error: "Bad id" });
+
+  const doc = await News.findByIdAndUpdate(id, { $set: { deletedAt: new Date() } }, { new: true });
+  if (!doc) return res.status(404).json({ ok: false, error: "Not found" });
+  res.json({ ok: true, item: doc });
+});
+
+
+app.post("/admin/news/:id/restore", requireCsrf, async (req, res) => {
+  const { id } = req.params;
+  if (!mongoose.isValidObjectId(id)) return res.status(400).json({ ok:false, error:"Bad id" });
+  const doc = await News.findByIdAndUpdate(id, { $set: { deletedAt: null } }, { new: true });
+  if (!doc) return res.status(404).json({ ok:false, error:"Not found" });
+  res.json({ ok: true, item: doc });
+});
+
+
 
 
 
