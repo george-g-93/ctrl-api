@@ -9,6 +9,8 @@ import session from "cookie-session"; // package name: cookie-session
 import speakeasy from "speakeasy";
 import QRCode from "qrcode";
 import AdminUser from "./models/AdminUser.js";
+import News from "./models/News.js";
+
 
 
 const app = express();
@@ -103,6 +105,20 @@ const ContactSchema = z.object({
   website: z.string().optional().default(""), // honeypot
 });
 
+
+
+const NewsCreateSchema = z.object({
+  title: z.string().min(3),
+  slug: z.string().min(3).regex(/^[a-z0-9-]+$/i, "Slug must be URL-friendly"),
+  date: z.string().or(z.date()), // accept ISO string; we’ll coerce
+  blurb: z.string().optional().default(""),
+  content: z.string().optional().default(""),
+  published: z.boolean().optional().default(true),
+});
+
+const NewsUpdateSchema = NewsCreateSchema.partial();
+
+
 // --- Validation schema ---
 const NewUserSchema = z.object({
   email: z.string().email(),
@@ -146,6 +162,8 @@ app.post("/contact", contactLimiter, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Server error" });
   }
 });
+
+app.use("/admin/news", requireAdminAndMfa); // same as messages/users
 
 app.get("/news", (_req, res) => {
   const sorted = [...news].sort((a, b) => new Date(b.date) - new Date(a.date));
@@ -308,6 +326,60 @@ app.delete("/admin/messages/:id", requireCsrf, async (req, res) => {
   if (!doc) return res.status(404).json({ ok: false, error: "Not found" });
   res.json({ ok: true, item: doc });
 });
+
+// List (with simple search + pagination)
+app.get("/admin/news", async (req, res) => {
+  const { q = "", page = "1", limit = "20" } = req.query;
+  const p = Math.max(parseInt(page), 1);
+  const l = Math.max(parseInt(limit), 1);
+  const where = q
+    ? { $or: [{ title: { $regex: q, $options: "i" } },
+              { blurb: { $regex: q, $options: "i" } },
+              { slug:  { $regex: q, $options: "i" } }] }
+    : {};
+  const [items, total] = await Promise.all([
+    News.find(where).sort({ date: -1, createdAt: -1 }).skip((p - 1) * l).limit(l).lean(),
+    News.countDocuments(where)
+  ]);
+  res.json({ ok: true, items, total });
+});
+
+// Create
+app.post("/admin/news", requireCsrf, async (req, res) => {
+  const data = NewsCreateSchema.parse(req.body);
+  const exists = await News.findOne({ slug: data.slug });
+  if (exists) return res.status(409).json({ ok: false, error: "Slug already exists" });
+  const doc = await News.create({
+    ...data,
+    date: new Date(data.date),
+  });
+  res.status(201).json({ ok: true, item: doc });
+});
+
+// Update by id
+app.patch("/admin/news/:id", requireCsrf, async (req, res) => {
+  const { id } = req.params;
+  if (!mongoose.isValidObjectId(id)) return res.status(400).json({ ok: false, error: "Bad id" });
+  const data = NewsUpdateSchema.parse(req.body);
+  if (data.slug) {
+    const dup = await News.findOne({ _id: { $ne: id }, slug: data.slug });
+    if (dup) return res.status(409).json({ ok: false, error: "Slug already exists" });
+  }
+  if (data.date) data.date = new Date(data.date);
+  const doc = await News.findByIdAndUpdate(id, { $set: data }, { new: true });
+  if (!doc) return res.status(404).json({ ok: false, error: "Not found" });
+  res.json({ ok: true, item: doc });
+});
+
+// Delete by id
+app.delete("/admin/news/:id", requireCsrf, async (req, res) => {
+  const { id } = req.params;
+  if (!mongoose.isValidObjectId(id)) return res.status(400).json({ ok: false, error: "Bad id" });
+  const r = await News.deleteOne({ _id: id });
+  if (!r.deletedCount) return res.status(404).json({ ok: false, error: "Not found" });
+  res.json({ ok: true });
+});
+
 
 // ---------- Admin Users ----------
 import mongoosePkg from "mongoose"; // if not already available as mongoose.*
