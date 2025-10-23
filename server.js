@@ -17,6 +17,7 @@ const app = express();
 
 app.set("trust proxy", 1);
 
+// CORS (site → api)
 const corsOptions = {
   origin: ["https://ctrlcompliance.co.uk", "https://www.ctrlcompliance.co.uk"],
   methods: ["GET","POST","PATCH","DELETE","OPTIONS"],
@@ -24,8 +25,11 @@ const corsOptions = {
   credentials: true,
 };
 
-// Apply CORS to all routes
 app.use(cors(corsOptions));
+
+// ✅ Express 5-safe preflight handler (matches any path)
+app.options(/^\/.*$/, cors(corsOptions));
+
 
 // Handle preflight for any path (Express 5: use regex or '/*')
 app.options(/^\/.*$/, cors(corsOptions));
@@ -172,17 +176,7 @@ app.post("/contact", contactLimiter, async (req, res) => {
   }
 });
 
-app.use("/admin/news", requireAdminAndMfa); // same as messages/users
 
-app.get("/news", (_req, res) => {
-  const sorted = [...news].sort((a, b) => new Date(b.date) - new Date(a.date));
-  res.json(sorted);
-});
-app.get("/news/:id", (req, res) => {
-  const item = news.find(n => n.id === req.params.id);
-  if (!item) return res.status(404).json({ error: "Not found" });
-  res.json(item);
-});
 
 app.use((req, _res, next) => {
   if (req.path.startsWith('/admin')) {
@@ -232,6 +226,22 @@ const requireMfa = (req, res, next) => {
   if (req.session?.mfaVerified === true) return next();
   return res.status(401).json({ ok: false, error: "MFA required" });
 };
+
+
+app.use("/admin/news", requireAdminAndMfa); // same as messages/users
+
+app.get("/news", (_req, res) => {
+  const sorted = [...news].sort((a, b) => new Date(b.date) - new Date(a.date));
+  res.json(sorted);
+});
+app.get("/news/:id", (req, res) => {
+  const item = news.find(n => n.id === req.params.id);
+  if (!item) return res.status(404).json({ error: "Not found" });
+  res.json(item);
+});
+
+
+
 
 app.post("/admin/login", requireCsrf, async (req, res) => {
   const { email, password } = req.body || {};
