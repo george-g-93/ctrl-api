@@ -10,7 +10,7 @@ import speakeasy from "speakeasy";
 import QRCode from "qrcode";
 import AdminUser from "./models/AdminUser.js";
 import News from "./models/News.js";
-import slugify from "slugify";
+//import slugify from "slugify";
 
 
 
@@ -439,10 +439,6 @@ app.post("/admin/news/:id/restore", requireCsrf, async (req, res) => {
   if (!doc) return res.status(404).json({ ok:false, error:"Not found" });
   res.json({ ok: true, item: doc });
 });
-
-
-
-
 
 
 app.post("/admin/login", requireCsrf, async (req, res) => {
