@@ -15,6 +15,8 @@ import News from "./models/News.js";
 
 const app = express();
 
+app.set("trust proxy", 1);
+
 const corsOptions = {
   origin: ["https://ctrlcompliance.co.uk", "https://www.ctrlcompliance.co.uk"],
   methods: ["GET","POST","PATCH","DELETE","OPTIONS"],
@@ -22,21 +24,16 @@ const corsOptions = {
   credentials: true,
 };
 
+// Apply CORS to all routes
 app.use(cors(corsOptions));
-// important: make Express answer CORS preflights with 204 + CORS headers
-app.options("*", cors(corsOptions));
 
+// Handle preflight for any path (Express 5: use regex or '/*')
+app.options(/^\/.*$/, cors(corsOptions));
 
-app.set("trust proxy", 1); // behind Nginx
-// CORS – allow your web origin
-app.use(cors({
-  origin: ["https://ctrlcompliance.co.uk", "https://www.ctrlcompliance.co.uk"],
-  methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token"],
-  credentials: true,
-}));
+// Body parsers etc.
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
+
 app.use((req, _res, next) => {
   if (req.is('text/plain') && typeof req.body === 'string') {
     try { req.body = JSON.parse(req.body); } catch { /* leave as string */ }
