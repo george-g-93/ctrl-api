@@ -1,6 +1,6 @@
 // FILE: models/News.js
 import mongoose from "mongoose";
-import slugify from "slugify";
+//import slugify from "slugify";
 
 // lightweight slug generator (no external deps)
 const makeSlug = (s) =>
