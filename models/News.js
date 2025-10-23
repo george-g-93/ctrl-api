@@ -1,13 +1,29 @@
-// models/News.js
+// FILE: models/News.js
 import mongoose from "mongoose";
+import slugify from "slugify";
 
-const NewsSchema = new mongoose.Schema({
-  title:   { type: String, required: true },
-  slug:    { type: String, required: true, unique: true, index: true },
-  date:    { type: Date,   required: true },
-  blurb:   { type: String, default: "" },
-  content: { type: String, default: "" }, // store HTML or markdown
-  published: { type: Boolean, default: true },
-}, { timestamps: true });
+const NewsSchema = new mongoose.Schema(
+  {
+    title: { type: String, required: true, trim: true, maxlength: 180 },
+    slug: { type: String, required: true, unique: true, index: true },
+    blurb: { type: String, default: "" , maxlength: 300 },
+    content: { type: String, default: "" },            // HTML or Markdown
+    coverUrl: { type: String, default: "" },
+    tags: [{ type: String, trim: true }],
+    status: { type: String, enum: ["draft", "published"], default: "draft", index: true },
+    publishedAt: { type: Date, default: null, index: true },
+    deletedAt: { type: Date, default: null, index: true },
+    author: { type: String, default: "CTRL" },
+  },
+  { timestamps: true }
+);
 
-export default mongoose.model("News", NewsSchema);
+// auto-generate slug on create or when title changes (if no slug provided)
+NewsSchema.pre("validate", function (next) {
+  if (!this.slug && this.title) {
+    this.slug = slugify(this.title, { lower: true, strict: true });
+  }
+  next();
+});
+
+export default mongoose.models.News || mongoose.model("News", NewsSchema);
