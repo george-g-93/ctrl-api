@@ -15,6 +15,18 @@ import News from "./models/News.js";
 
 const app = express();
 
+const corsOptions = {
+  origin: ["https://ctrlcompliance.co.uk", "https://www.ctrlcompliance.co.uk"],
+  methods: ["GET","POST","PATCH","DELETE","OPTIONS"],
+  allowedHeaders: ["Content-Type","Authorization","X-CSRF-Token"],
+  credentials: true,
+};
+
+app.use(cors(corsOptions));
+// important: make Express answer CORS preflights with 204 + CORS headers
+app.options("*", cors(corsOptions));
+
+
 app.set("trust proxy", 1); // behind Nginx
 // CORS – allow your web origin
 app.use(cors({
@@ -193,51 +205,36 @@ app.get("/admin/csrf", (req, res) => {
   res.json({ csrf: req.session.csrf });
 });
 const requireCsrf = (req, res, next) => {
-  if (req.method === "GET") return next();
+  // allow GET and CORS preflights to pass
+  if (req.method === "GET" || req.method === "OPTIONS") return next();
   if (req.session?.csrf && req.get("X-CSRF-Token") === req.session.csrf) return next();
   return res.status(403).json({ ok: false, error: "CSRF" });
 };
+
 const requireAdmin = (req, res, next) => {
+  if (req.method === "OPTIONS") return next();   // <-- allow preflight
   if (req.session?.admin === true) return next();
   return res.status(401).json({ ok: false, error: "Unauthorized" });
 };
+
+const requireAdminAndMfa = async (req, res, next) => {
+  if (req.method === "OPTIONS") return next();   // <-- allow preflight
+  if (req.path.startsWith("/admin/2fa/")) return next();
+  if (!req.session?.admin) return res.status(401).json({ ok: false, error: "Unauthorized" });
+  if (!(await isMfaEnrolled(req.session.email))) {
+    return res.status(401).json({ ok: false, error: "MFA required (not enrolled)" });
+  }
+  if (!isMfaVerified(req)) {
+    return res.status(401).json({ ok: false, error: "MFA required" });
+  }
+  next();
+};
+
 
 const requireMfa = (req, res, next) => {
   if (req.session?.mfaVerified === true) return next();
   return res.status(401).json({ ok: false, error: "MFA required" });
 };
-
-
-
-
-// app.post("/admin/login", requireCsrf, async (req, res) => {
-//   const { email, password } = req.body || {};
-//   if (!email || !password) return res.status(400).json({ ok: false, error: "Missing credentials" });
-
-//   const ok = email === process.env.ADMIN_EMAIL &&
-//     await bcrypt.compare(password, process.env.ADMIN_PASSWORD_HASH || "");
-//   if (!ok) return res.status(401).json({ ok: false, error: "Invalid credentials" });
-
-//   // ensure a record exists for this admin email
-//   const user = await AdminUser.findOneAndUpdate(
-//     { email },
-//     { $setOnInsert: { email } },
-//     { new: true, upsert: true }
-//   );
-
-//   // baseline session
-//   req.session.admin = true;
-//   req.session.email = email;
-
-
-//   // after login, enforce MFA if enrolled OR allow enrolment if not yet enrolled
-//   const enrolled = !!user.mfaSecret;
-
-//   // IMPORTANT: you haven’t verified MFA for this *session* yet
-//   req.session.mfaVerified = false;
-
-//   return res.json({ ok: true, mfaRequired: true, enrolled });
-// });
 
 app.post("/admin/login", requireCsrf, async (req, res) => {
   const { email, password } = req.body || {};
@@ -271,17 +268,6 @@ app.post("/admin/logout", requireAdmin, requireCsrf, (req, res) => {
   req.session = null;
   res.json({ ok: true });
 });
-
-const requireAdminAndMfa = async (req, res, next) => {
-  if (req.path.startsWith("/admin/2fa/")) return next();
-  if (!req.session?.admin) return res.status(401).json({ ok: false, error: "Unauthorized" });
-  if (!(await isMfaEnrolled(req.session.email))) {
-    return res.status(401).json({ ok: false, error: "MFA required (not enrolled)" });
-  }
-  if (!isMfaVerified(req)) return res.status(401).json({ ok: false, error: "MFA required" });
-  next();
-};
-
 
 // protect your admin data routes with this middleware
 app.use("/admin/messages", requireAdminAndMfa);
