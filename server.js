@@ -16,24 +16,34 @@ import News from "./models/News.js";
 
 const app = express();
 
+const IS_DEV = process.env.NODE_ENV !== "production";
 app.set("trust proxy", 1);
 
-// CORS (site → api)
+const ALLOWED_ORIGINS = new Set([
+  "https://ctrlcompliance.co.uk",
+  "https://www.ctrlcompliance.co.uk",
+  "http://localhost:5173",     // Vite default
+  "http://127.0.0.1:5173",
+  "http://localhost:3000",     // Next/CRA
+  "http://127.0.0.1:3000",
+]);
+
 const corsOptions = {
-  origin: ["https://ctrlcompliance.co.uk", "https://www.ctrlcompliance.co.uk"],
-  methods: ["GET","POST","PATCH","DELETE","OPTIONS"],
-  allowedHeaders: ["Content-Type","Authorization","X-CSRF-Token"],
+  origin(origin, cb) {
+    // allow server-to-server / curl (no Origin header)
+    if (!origin) return cb(null, true);
+    if (ALLOWED_ORIGINS.has(origin)) return cb(null, true);
+    cb(new Error("CORS blocked: " + origin));
+  },
   credentials: true,
+  methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token"],
 };
 
 app.use(cors(corsOptions));
+// Make sure preflights succeed:
+app.options("*", cors(corsOptions));
 
-// ✅ Express 5-safe preflight handler (matches any path)
-app.options(/^\/.*$/, cors(corsOptions));
-
-
-// Handle preflight for any path (Express 5: use regex or '/*')
-app.options(/^\/.*$/, cors(corsOptions));
 
 // Body parsers etc.
 app.use(express.json());
@@ -51,10 +61,10 @@ app.use(session({
   name: "sid",
   secret: process.env.SESSION_SECRET || "dev-secret",
   httpOnly: true,
-  secure: true, // requires HTTPS; you have it
-  sameSite: "none", // allow cross-site from ctrlcompliance.co.uk to api.ctrl...
-  domain: ".ctrlcompliance.co.uk", // cookie valid on both site + api subdomain
-  maxAge: 1000 * 60 * 60 * 8, // 8 hours
+  secure: IS_DEV ? false : true,                 // allow http on localhost
+  sameSite: IS_DEV ? "lax" : "none",             // cross-site for prod, simpler in dev
+  domain: IS_DEV ? undefined : ".ctrlcompliance.co.uk", // don't pin domain in dev
+  maxAge: 1000 * 60 * 60 * 8,
 }));
 
 // in-memory demo data; swap to DynamoDB later
