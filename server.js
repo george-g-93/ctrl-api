@@ -20,12 +20,16 @@ const IS_DEV = process.env.NODE_ENV !== "production";
 app.set("trust proxy", 1);
 
 const ALLOWED_ORIGINS = new Set([
-  "https://ctrlcompliance.co.uk",
+   "https://ctrlcompliance.co.uk",
   "https://www.ctrlcompliance.co.uk",
-  "http://localhost:5173",     // Vite default
+
+  // dev ports
+  "http://localhost:5173",
   "http://127.0.0.1:5173",
-  "http://localhost:3000",     // Next/CRA
+  "http://localhost:3000",
   "http://127.0.0.1:3000",
+  "http://localhost:5180",        // 👈 add this
+  "http://127.0.0.1:5180",        // 👈 and this
 ]);
 
 const corsOptions = {
