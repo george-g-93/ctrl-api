@@ -10,7 +10,14 @@ import speakeasy from "speakeasy";
 import QRCode from "qrcode";
 import AdminUser from "./models/AdminUser.js";
 import News from "./models/News.js";
-//import slugify from "slugify";
+import AdminAuthLog from "./models/AdminAuthLog.js";
+import AdminAuthLock from "./models/AdminAuthLock.js";
+import 'dotenv/config';
+import Blog from "./models/Blogs.js";
+import BlogComment from "./models/BlogComment.js";
+import crypto from "crypto";
+
+
 
 
 
@@ -20,7 +27,7 @@ const IS_DEV = process.env.NODE_ENV !== "production";
 app.set("trust proxy", 1);
 
 const ALLOWED_ORIGINS = new Set([
-   "https://ctrlcompliance.co.uk",
+  "https://ctrlcompliance.co.uk",
   "https://www.ctrlcompliance.co.uk",
 
   // dev ports
@@ -71,6 +78,13 @@ app.use(session({
   maxAge: 1000 * 60 * 60 * 8,
 }));
 
+function getClientIp(req) {
+  const xf = req.headers["x-forwarded-for"];
+  if (xf && typeof xf === "string") return xf.split(",")[0].trim();
+  return req.ip;
+}
+
+
 // in-memory demo data; swap to DynamoDB later
 // const news = [
 //   {
@@ -108,6 +122,31 @@ async function setPersistedMfaSecret(email, secret) {
   );
 }
 
+// --- Remembered device helpers ---
+function hashDeviceMarker(marker) {
+  return crypto.createHash("sha256").update(marker).digest("hex");
+}
+
+async function addTrustedDevice(email, marker) {
+  const hashed = hashDeviceMarker(marker);
+  const expiresAt = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000);
+  await AdminUser.updateOne(
+    { email },
+    { $push: { trustedDevices: { markerHash: hashed, expiresAt } } },
+    { upsert: false }
+  );
+}
+
+async function isTrustedDevice(email, marker) {
+  if (!marker) return false;
+  const hashed = hashDeviceMarker(marker);
+  const u = await AdminUser.findOne({ email }).lean();
+  if (!u?.trustedDevices) return false;
+  return u.trustedDevices.some(
+    (d) => d.markerHash === hashed && d.expiresAt > new Date()
+  );
+}
+
 // --- Connect to Mongo ---
 const mongoUri = process.env.MONGODB_URI; // set in systemd env or .env
 mongoose.set("strictQuery", true);
@@ -122,6 +161,15 @@ const contactLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 });
+
+const loginLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,     // 10 minutes
+  max: 50,                      // generous; the real protection is the account lock
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.post("/admin/login", loginLimiter); // attach before the route definition if using app-level middleware
+
 
 // --- Validation schema ---
 const ContactSchema = z.object({
@@ -142,12 +190,15 @@ const NewsCreateSchema = z.object({
   coverUrl: z.string().url().optional().or(z.literal("")).default(""),
   tags: z.array(z.string().min(1).max(24)).optional().default([]),
   slug: z.string().min(3).max(200).optional().default(""),
-  status: z.enum(["draft","published"]).optional().default("draft"),
+  status: z.enum(["draft", "published"]).optional().default("draft"),
   publishedAt: z.string().datetime().optional().nullable(),
 });
 
 const NewsUpdateSchema = NewsCreateSchema.partial();
 
+// --- Auth lockout policy ---
+const AUTH_MAX_FAILED = parseInt(process.env.AUTH_MAX_FAILED ?? "5", 10);          // failures before lock
+const AUTH_LOCK_MINUTES = parseInt(process.env.AUTH_LOCK_MINUTES ?? "30", 10);     // lock duration
 
 
 
@@ -333,7 +384,7 @@ app.get("/admin/news", async (req, res) => {
   if (q) {
     where.$or = [
       { title: { $regex: q, $options: "i" } },
-      { slug:  { $regex: q, $options: "i" } },
+      { slug: { $regex: q, $options: "i" } },
       { blurb: { $regex: q, $options: "i" } },
     ];
   }
@@ -364,7 +415,7 @@ app.post("/admin/news", requireCsrf, async (req, res) => {
   try {
     const body = NewsUpsertSchema.parse(req.body);
     const slug = (body.slug && body.slug.trim()) ||
-                 (await import("slugify")).default(body.title, { lower: true, strict: true });
+      (await import("slugify")).default(body.title, { lower: true, strict: true });
 
     const publishedAt = body.published
       ? (body.date ? new Date(body.date) : new Date())
@@ -403,7 +454,7 @@ app.patch("/admin/news/:id", requireCsrf, async (req, res) => {
 
     const update = {};
     if (body.title !== undefined) update.title = body.title;
-    if (body.slug !== undefined)  update.slug  = body.slug.trim();
+    if (body.slug !== undefined) update.slug = body.slug.trim();
     if (body.blurb !== undefined) update.blurb = body.blurb;
     if (body.content !== undefined) update.content = body.content;
     if (body.coverUrl !== undefined) update.coverUrl = body.coverUrl;
@@ -448,39 +499,130 @@ app.delete("/admin/news/:id", requireCsrf, async (req, res) => {
 
 app.post("/admin/news/:id/restore", requireCsrf, async (req, res) => {
   const { id } = req.params;
-  if (!mongoose.isValidObjectId(id)) return res.status(400).json({ ok:false, error:"Bad id" });
+  if (!mongoose.isValidObjectId(id)) return res.status(400).json({ ok: false, error: "Bad id" });
   const doc = await News.findByIdAndUpdate(id, { $set: { deletedAt: null } }, { new: true });
-  if (!doc) return res.status(404).json({ ok:false, error:"Not found" });
+  if (!doc) return res.status(404).json({ ok: false, error: "Not found" });
   res.json({ ok: true, item: doc });
 });
 
 
+// app.post("/admin/login", requireCsrf, async (req, res) => {
+//   const { email, password } = req.body || {};
+//   if (!email || !password) {
+//     return res.status(400).json({ ok: false, error: "Missing credentials" });
+//   }
+
+//   const user = await AdminUser.findOne({ email });
+//   if (!user) {
+//     return res.status(401).json({ ok: false, error: "Invalid credentials" });
+//   }
+
+//   const ok = await bcrypt.compare(password, user.passwordHash);
+//   if (!ok) {
+//     return res.status(401).json({ ok: false, error: "Invalid credentials" });
+//   }
+
+//   // baseline session
+//   req.session.admin = true;
+//   req.session.email = email;
+//   req.session.mfaVerified = false;
+//   user.lastLoginAt = new Date();
+//   await user.save();
+
+//   const enrolled = !!user.mfaSecret;
+//   return res.json({ ok: true, mfaRequired: true, enrolled });
+// });
+
 app.post("/admin/login", requireCsrf, async (req, res) => {
   const { email, password } = req.body || {};
+  const ip = getClientIp(req);
+  const ua = req.headers["user-agent"] || "";
+
+  // Basic validation
   if (!email || !password) {
+    await AdminAuthLog.create({ email: email || "", ip, ua, success: false, reason: "missing_credentials" });
     return res.status(400).json({ ok: false, error: "Missing credentials" });
   }
 
+  // Check lock status
+  const now = new Date();
+  let lock = await AdminAuthLock.findOne({ email });
+
+  if (lock?.lockUntil && lock.lockUntil > now) {
+    const remainingMs = lock.lockUntil - now;
+    const mins = Math.ceil(remainingMs / 60000);
+    await AdminAuthLog.create({ email, ip, ua, success: false, reason: "locked" });
+    return res.status(423).json({
+      ok: false,
+      error: "Account locked due to repeated failed attempts",
+      locked: true,
+      minutesRemaining: mins,
+      unlockAt: lock.lockUntil,
+    });
+  }
+
+  // Find user
   const user = await AdminUser.findOne({ email });
   if (!user) {
+    // increment failed count
+    if (!lock) lock = await AdminAuthLock.create({ email, failedCount: 0 });
+    lock.failedCount = (lock.failedCount || 0) + 1;
+    lock.lastFailedAt = now;
+
+    if (lock.failedCount >= AUTH_MAX_FAILED) {
+      lock.lockUntil = new Date(now.getTime() + AUTH_LOCK_MINUTES * 60000);
+    }
+    await lock.save();
+
+    await AdminAuthLog.create({ email, ip, ua, success: false, reason: "user_not_found" });
     return res.status(401).json({ ok: false, error: "Invalid credentials" });
   }
 
+  // Compare password
   const ok = await bcrypt.compare(password, user.passwordHash);
   if (!ok) {
+    if (!lock) lock = await AdminAuthLock.create({ email, failedCount: 0 });
+    lock.failedCount = (lock.failedCount || 0) + 1;
+    lock.lastFailedAt = now;
+
+    if (lock.failedCount >= AUTH_MAX_FAILED) {
+      lock.lockUntil = new Date(now.getTime() + AUTH_LOCK_MINUTES * 60000);
+    }
+    await lock.save();
+
+    await AdminAuthLog.create({ email, ip, ua, success: false, reason: "invalid_password" });
     return res.status(401).json({ ok: false, error: "Invalid credentials" });
+  }
+
+  // Success → reset lock info
+  if (lock) {
+    lock.failedCount = 0;
+    lock.lockUntil = null;
+    await lock.save();
   }
 
   // baseline session
   req.session.admin = true;
   req.session.email = email;
   req.session.mfaVerified = false;
+
   user.lastLoginAt = new Date();
   await user.save();
+
+  // Check for remembered device
+  const rememberedMarker = req.body?.deviceMarker;
+  if (rememberedMarker && (await isTrustedDevice(email, rememberedMarker))) {
+    req.session.mfaVerified = true;
+    await AdminAuthLog.create({ email, ip, ua, success: true, reason: "trusted_device" });
+    return res.json({ ok: true, mfaRequired: false });
+  }
+
+  await AdminAuthLog.create({ email, ip, ua, success: true, reason: "" });
 
   const enrolled = !!user.mfaSecret;
   return res.json({ ok: true, mfaRequired: true, enrolled });
 });
+
 
 
 app.post("/admin/logout", requireAdmin, requireCsrf, (req, res) => {
@@ -538,9 +680,11 @@ app.get("/admin/news", async (req, res) => {
   const p = Math.max(parseInt(page), 1);
   const l = Math.max(parseInt(limit), 1);
   const where = q
-    ? { $or: [{ title: { $regex: q, $options: "i" } },
-              { blurb: { $regex: q, $options: "i" } },
-              { slug:  { $regex: q, $options: "i" } }] }
+    ? {
+      $or: [{ title: { $regex: q, $options: "i" } },
+      { blurb: { $regex: q, $options: "i" } },
+      { slug: { $regex: q, $options: "i" } }]
+    }
     : {};
   const [items, total] = await Promise.all([
     News.find(where).sort({ date: -1, createdAt: -1 }).skip((p - 1) * l).limit(l).lean(),
@@ -637,6 +781,39 @@ app.post("/admin/users/:id/reset-mfa", requireCsrf, async (req, res) => {
   res.json({ ok: true });
 });
 
+app.get("/admin/me", requireAdmin, (req, res) => {
+  res.json({ ok: true, email: req.session?.email || "admin" });
+});
+
+// GET /admin/auth-logs
+app.get("/admin/auth-logs", requireAdmin, async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page || "1", 10));
+    const limit = Math.max(1, Math.min(100, parseInt(req.query.limit || "50", 10)));
+    const q = (req.query.q || "").trim();
+
+    const filter = {};
+    if (q) {
+      filter.$or = [
+        { email: new RegExp(q, "i") },
+        { ip: new RegExp(q, "i") },
+        { reason: new RegExp(q, "i") },
+      ];
+    }
+
+    const total = await AdminAuthLog.countDocuments(filter);
+    const items = await AdminAuthLog.find(filter)
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean();
+
+    res.json({ ok: true, items, total });
+  } catch (e) {
+    console.error("AuthLog fetch failed", e);
+    res.status(500).json({ error: "Failed to load auth logs" });
+  }
+});
 
 // Optional: restore
 app.post("/admin/messages/:id/restore", requireCsrf, async (req, res) => {
@@ -690,6 +867,7 @@ app.post("/admin/2fa/verify", requireCsrf, async (req, res) => {
     encoding: "base32",
     token,
     window: 1, // tolerate ±30s drift
+
   });
 
   if (!valid) return res.status(401).json({ ok: false, error: "Invalid code" });
@@ -702,8 +880,235 @@ app.post("/admin/2fa/verify", requireCsrf, async (req, res) => {
 
   // mark this session as MFA-verified
   req.session.mfaVerified = true;
+
+  // Handle "remember this browser"
+  const { remember } = req.body || {};
+  if (remember) {
+    const marker = crypto.randomBytes(24).toString("hex");
+    await addTrustedDevice(req.session.email, marker);
+    return res.json({ ok: true, deviceMarker: marker });
+  }
+
   return res.json({ ok: true });
+
 });
+
+
+
+//Blog section
+// ---------- ADMIN BLOGS ----------
+app.get("/admin/blogs", requireAdmin, async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
+  const q = (req.query.q || "").trim();
+
+  const filter = { deletedAt: null };
+  if (q) {
+    const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    Object.assign(filter, {
+      $or: [
+        { title: rx }, { slug: rx }, { blurb: rx }, { content: rx }, { tags: rx }, { author: rx },
+      ],
+    });
+  }
+
+  const [items, total] = await Promise.all([
+    Blog.find(filter)
+      .sort({ date: -1, _id: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean(),
+    Blog.countDocuments(filter),
+  ]);
+
+  res.json({ ok: true, items, total, page, limit });
+});
+
+app.post("/admin/blogs", requireAdmin, requireMfa, requireCsrf, async (req, res) => {
+  const { title, slug, date, blurb, content, published, author, tags = [], heroUrl } = req.body || {};
+  if (!title) return res.status(400).json({ ok: false, error: "Title is required" });
+  const doc = await Blog.create({
+    title,
+    slug: slug || title.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-"),
+    date: date ? new Date(date) : new Date(),
+    blurb: blurb || "",
+    content: content || "",
+    published: !!published,
+    author: author || "",
+    tags: Array.isArray(tags) ? tags : [],
+    heroUrl: heroUrl || "",
+  });
+  res.json({ ok: true, item: doc });
+});
+
+app.patch("/admin/blogs/:id", requireAdmin, requireMfa, requireCsrf, async (req, res) => {
+  const { id } = req.params;
+  const { title, slug, date, blurb, content, published, author, tags, heroUrl } = req.body || {};
+  const update = {};
+  if (title != null) update.title = title;
+  if (slug != null) update.slug = slug;
+  if (date != null) update.date = new Date(date);
+  if (blurb != null) update.blurb = blurb;
+  if (content != null) update.content = content;
+  if (published != null) update.published = !!published;
+  if (author != null) update.author = author;
+  if (tags != null) update.tags = Array.isArray(tags) ? tags : [];
+  if (heroUrl != null) update.heroUrl = heroUrl;
+  update.updatedAt = new Date();
+
+  const doc = await Blog.findByIdAndUpdate(id, update, { new: true });
+  if (!doc) return res.status(404).json({ ok: false, error: "Not found" });
+  res.json({ ok: true, item: doc });
+});
+
+app.delete("/admin/blogs/:id", requireAdmin, requireMfa, requireCsrf, async (req, res) => {
+  const { id } = req.params;
+  const doc = await Blog.findByIdAndUpdate(id, { deletedAt: new Date() }, { new: true });
+  if (!doc) return res.status(404).json({ ok: false, error: "Not found" });
+  res.json({ ok: true });
+});
+
+// ---------- PUBLIC BLOGS ----------
+app.get("/blogs", async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
+  const q = (req.query.q || "").trim();
+  const tag = (req.query.tag || "").trim();
+  const includeUnpublished = req.query.includeUnpublished === "true"; // keep false in prod site
+
+  const filter = { deletedAt: null };
+  if (!includeUnpublished) filter.published = true;
+  if (q) {
+    const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    Object.assign(filter, { $or: [{ title: rx }, { blurb: rx }, { content: rx }, { tags: rx }, { author: rx }] });
+  }
+  if (tag) filter.tags = tag;
+
+  const [items, total] = await Promise.all([
+    Blog.find(filter)
+      .sort({ date: -1, _id: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .select("-content") // list view: omit heavy content
+      .lean(),
+    Blog.countDocuments(filter),
+  ]);
+
+  res.json({ ok: true, items, total, page, limit });
+});
+
+app.get("/blogs/:slug", async (req, res) => {
+  const { slug } = req.params;
+  const includeUnpublished = req.query.includeUnpublished === "true";
+  const filter = { slug, deletedAt: null };
+  if (!includeUnpublished) filter.published = true;
+
+  const doc = await Blog.findOne(filter).lean();
+  if (!doc) return res.status(404).json({ ok: false, error: "Not found" });
+  res.json({ ok: true, item: doc });
+});
+
+// --- PUBLIC: List comments for a blog by slug (approved only) ---
+app.get("/blogs/:slug/comments", async (req, res) => {
+  const { slug } = req.params;
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
+
+  const blog = await Blog.findOne({ slug, deletedAt: null, published: true }).select("_id slug").lean();
+  if (!blog) return res.status(404).json({ ok: false, error: "Blog not found" });
+
+  const filter = { slug: blog.slug, blogId: blog._id, approved: true, deletedAt: null };
+  const [items, total] = await Promise.all([
+    BlogComment.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+    BlogComment.countDocuments(filter),
+  ]);
+
+  // only return public fields
+  const publicItems = items.map(({ _id, name, body, createdAt }) => ({ _id, name, body, createdAt }));
+
+  res.json({ ok: true, items: publicItems, total, page, limit });
+});
+
+// --- PUBLIC: Post a comment (awaiting approval) ---
+app.post("/blogs/:slug/comments", express.json(), async (req, res) => {
+  const { slug } = req.params;
+  const { name, email, body, website } = req.body || {}; // website = honeypot
+
+  // Honeypot (bots often fill this)
+  if (website) return res.status(200).json({ ok: true }); // silently drop
+
+  // Basic validation
+  if (!name || !body || typeof name !== "string" || typeof body !== "string") {
+    return res.status(400).json({ ok: false, error: "Name and comment are required" });
+  }
+  if (name.length > 80 || body.length > 4000) {
+    return res.status(400).json({ ok: false, error: "Input too long" });
+  }
+
+  // Find blog
+  const blog = await Blog.findOne({ slug, deletedAt: null, published: true }).select("_id slug").lean();
+  if (!blog) return res.status(404).json({ ok: false, error: "Blog not found" });
+
+  // Save (unapproved by default)
+  const ip = (req.headers["x-forwarded-for"] || req.ip || "").toString().split(",")[0].trim();
+  const ua = req.headers["user-agent"] || "";
+
+  await BlogComment.create({
+    blogId: blog._id,
+    slug: blog.slug,
+    name: name.trim(),
+    email: (email || "").trim(),
+    body: body.trim(),
+    approved: false,
+    ip, ua,
+  });
+
+  res.status(201).json({ ok: true, pending: true, message: "Thanks! Your comment is awaiting approval." });
+});
+
+// --- ADMIN: list comments (with filters) ---
+app.get("/admin/blog-comments", requireAdmin, async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
+  const approved = req.query.approved;
+  const slug = (req.query.slug || "").trim();
+  const q = (req.query.q || "").trim();
+
+  const filter = { deletedAt: null };
+  if (approved === "true") filter.approved = true;
+  if (approved === "false") filter.approved = false;
+  if (slug) filter.slug = slug;
+  if (q) {
+    const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    Object.assign(filter, { $or: [{ name: rx }, { body: rx }, { email: rx }] });
+  }
+
+  const [items, total] = await Promise.all([
+    BlogComment.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+    BlogComment.countDocuments(filter),
+  ]);
+
+  res.json({ ok: true, items, total, page, limit });
+});
+
+// --- ADMIN: approve / unapprove ---
+app.patch("/admin/blog-comments/:id", requireAdmin, requireMfa, requireCsrf, async (req, res) => {
+  const { id } = req.params;
+  const { approved } = req.body || {};
+  const doc = await BlogComment.findByIdAndUpdate(id, { approved: !!approved }, { new: true });
+  if (!doc) return res.status(404).json({ ok: false, error: "Not found" });
+  res.json({ ok: true, item: doc });
+});
+
+// --- ADMIN: delete (soft) ---
+app.delete("/admin/blog-comments/:id", requireAdmin, requireMfa, requireCsrf, async (req, res) => {
+  const { id } = req.params;
+  const doc = await BlogComment.findByIdAndUpdate(id, { deletedAt: new Date() }, { new: true });
+  if (!doc) return res.status(404).json({ ok: false, error: "Not found" });
+  res.json({ ok: true });
+});
+
+
 
 
 
